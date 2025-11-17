@@ -167,6 +167,21 @@ enable_octavia: true
 designate_adoption: false
 enable_designate: false
 
+# Enable BIND9 backend for Designate with IP preservation
+enable_designate_bind9: false
+
+# External network CIDR for BIND9 servers (should match TripleO deployment)
+external_network_cidr: "192.0.2.0/24"
+
+# NS records for DNS zones (extracted from source deployment or configured manually)
+# designate_ns_records:
+#   - hostname: ns1.example.com.
+#     priority: 1
+#   - hostname: ns2.example.com.
+#     priority: 2
+#   - hostname: ns3.example.com.
+#     priority: 3
+
 # Whether source env is OSPD Director Operator
 # i.e. https://github.com/openstack-k8s-operators/osp-director-operator
 ospdo_src: false

@@ -1,4 +1,33 @@
 ---
+# Retry configuration for Designate services
+designate_retry_delay: 5
+
+# Enable BIND9 backend adoption with IP preservation
+enable_designate_bind9: true
+
+# Network name for Designate control plane (for MDNS, Worker communications)
+designate_control_network: designate
+
+# BIND9 configuration - IPs will be extracted from source deployment
+designate_bind9_ips: []
+designate_bind9_network_cidr: ""
+designate_bind9_network_range_start: ""
+designate_bind9_network_range_end: ""
+
+# NS records for the DNS zones - these should match the source deployment
+designate_ns_records:
+  - hostname: ns1.example.com.
+    priority: 1
+  - hostname: ns2.example.com.
+    priority: 2
+
+# Number of BIND9 replicas to deploy (should match source)
+designate_bind9_replicas: 3
+
+# Storage configuration for BIND9
+designate_bind9_storage_class: "{{ storage_class_name | default('local-storage') }}"
+designate_bind9_storage_request: "1Gi"
+
 designate_patch: |
   spec:
     designate:
@@ -31,7 +60,33 @@ designate_patch: |
           replicas: 1
         designateWorker:
           replicas: 1
+          networkAttachments:
+            - {{ designate_control_network }}
         designateMdns:
           replicas: 1
+          networkAttachments:
+            - {{ designate_control_network }}
         designateProducer:
           replicas: 1
+        {% if enable_designate_bind9|default(false) %}
+        designateBackendbind9:
+          replicas: {{ designate_bind9_replicas }}
+          controlNetworkName: {{ designate_control_network }}
+          storageClass: {{ designate_bind9_storage_class }}
+          storageRequest: {{ designate_bind9_storage_request }}
+          override:
+            services:
+              {% for i in range(designate_bind9_replicas) %}
+              - name: designate-bind9-{{ i }}
+                spec:
+                  type: LoadBalancer
+                  {% if designate_bind9_ips and designate_bind9_ips|length > i %}
+                  loadBalancerIP: {{ designate_bind9_ips[i] }}
+                  {% endif %}
+              {% endfor %}
+        {% endif %}
+        nsRecords:
+          {% for ns_record in designate_ns_records %}
+          - hostname: {{ ns_record.hostname }}
+            priority: {{ ns_record.priority }}
+          {% endfor %}

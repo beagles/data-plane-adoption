@@ -1,0 +1,62 @@
+---
+# Create NetworkAttachmentDefinition for Designate
+# This creates a NAD that allows BIND9 pods to use predictable IPs
+# matching the TripleO deployment
+
+- name: Calculate network parameters for NAD
+  when: designate_bind9_ips|length > 0
+  block:
+    - name: Calculate IP range for OpenShift pod allocation
+      ansible.builtin.set_fact:
+        # Allocate first 50 IPs for OpenShift pods (MDNS, Worker, etc.)
+        # Next 25 IPs reserved for BIND9 predictable IPs (matching operator pool size)
+        nad_range_end: "{{ (designate_bind9_ips | first | ansible.utils.ipaddr('address') | ansible.utils.ipmath(-1)) }}"
+
+    - name: Set NAD configuration with preserved IP pool
+      ansible.builtin.set_fact:
+        designate_nad_config:
+          apiVersion: "k8s.cni.cncf.io/v1"
+          kind: NetworkAttachmentDefinition
+          metadata:
+            name: "{{ designate_control_network }}"
+            namespace: "{{ rhoso_namespace }}"
+          spec:
+            config: |
+              {
+                "cniVersion": "0.3.1",
+                "type": "bridge",
+                "bridge": "ospbr",
+                "ipam": {
+                  "type": "whereabouts",
+                  "range": "{{ designate_bind9_network_cidr }}",
+                  "range_start": "{{ designate_bind9_network_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(10) }}",
+                  "range_end": "{{ nad_range_end }}"
+                }
+              }
+
+- name: Create NetworkAttachmentDefinition for Designate
+  when: designate_bind9_ips|length > 0
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    cat <<EOF | oc apply -f -
+    {{ designate_nad_config | to_nice_yaml }}
+    EOF
+  register: nad_creation_result
+  changed_when: "'created' in nad_creation_result.stdout or 'configured' in nad_creation_result.stdout"
+
+- name: Verify NetworkAttachmentDefinition created successfully
+  when: designate_bind9_ips|length > 0
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc get network-attachment-definitions {{ designate_control_network }} -n {{ rhoso_namespace }}
+  register: nad_verify_result
+  retries: 5
+  delay: 2
+  until: nad_verify_result.rc == 0
+
+- name: Display NAD status
+  ansible.builtin.debug:
+    msg: "NetworkAttachmentDefinition '{{ designate_control_network }}' created successfully"
+  when: designate_bind9_ips|length > 0

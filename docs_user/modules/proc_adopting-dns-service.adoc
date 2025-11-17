@@ -1,0 +1,434 @@
+:_mod-docs-content-type: PROCEDURE
+[id="adopting-the-dns-service_{context}"]
+
+= Adopting the {dns_service}
+
+[role="_abstract"]
+To adopt the {dns_service_first_ref}, you patch an existing `OpenStackControlPlane` custom resource (CR) where {dns_service} is disabled. The patch starts the service with the configuration parameters that are provided by the {rhos_prev_long} ({OpenStackShort}) environment.
+
+The {dns_service} adoption is complete when you see the following results:
+
+* The `DesignateAPI`, `DesignateCentral`, `DesignateWorker`, `DesignateMDNS`, and `DesignateProducer` services are running.
+* If using BIND9 backend: The `DesignateBackendbind9` StatefulSet is running with preserved IP addresses from the source deployment.
+* Keystone endpoints are updated.
+* Existing DNS zones are accessible and zone transfers are functioning.
+
+[IMPORTANT]
+====
+{dns_service} BIND9 backend servers act as authoritative DNS servers that are integrated with external DNS infrastructure. These servers typically have IP addresses that cannot be arbitrarily changed because:
+
+* External DNS delegation (NS records and glue records) reference these IPs
+* Unbound resolver servers are configured with these IPs
+* DNS protocol relies on stable nameserver addresses
+
+This procedure implements *Strategy 1: IP Preservation with Predictable IPs* to maintain the same BIND9 IP addresses after migration.
+====
+
+.Prerequisites
+
+* You have completed the previous adoption steps.
+* The source TripleO {dns_service} deployment includes BIND9 backend servers with fixed IP addresses.
+* You have identified the network subnet used by BIND9 servers on the source deployment.
+* The BIND9 IP addresses can be accommodated within the NetworkAttachmentDefinition predictable IP pool.
+
+== Understanding {dns_service} architecture and IP requirements
+
+{dns_service} in TripleO deploys with the following components:
+
+* *DesignateAPI*: REST API service for DNS zone and record management
+* *DesignateCentral*: Coordination service that manages zone changes
+* *DesignateWorker*: Processes zone updates and communicates with DNS backends
+* *DesignateMDNS*: Mini-DNS service that acts as a hidden primary, transferring zones to BIND9 secondaries
+* *DesignateProducer*: Handles periodic tasks
+* *BIND9 Backend*: Secondary (slave) nameservers that receive zone transfers via AXFR/IXFR
+
+In the BIND9 backend model:
+
+. DesignateMDNS acts as the hidden primary nameserver
+. BIND9 servers are configured as secondaries (slaves)
+. When zones are updated through the API, MDNS sends NOTIFY messages to BIND9
+. BIND9 servers initiate zone transfers (AXFR/IXFR) from MDNS
+. External DNS queries are served directly by BIND9 servers
+
+[source,text]
+----
+External DNS Queries → BIND9 Secondaries (192.0.2.10-12) ← Zone Transfers ← DesignateMDNS (hidden)
+                              ↑
+                       (Stable public IPs required)
+----
+
+== Extracting BIND9 configuration from the source deployment
+
+.Procedure
+
+. Identify the BIND9 server IP addresses from your TripleO deployment:
++
+[source,bash]
+----
+$ ansible designate_bind -m shell -a "ip addr show | grep 'inet.*external'"
+designate-bind-0 | CHANGED | rc=0 >>
+    inet 192.0.2.10/24 brd 192.0.2.255 scope global eth1
+designate-bind-1 | CHANGED | rc=0 >>
+    inet 192.0.2.11/24 brd 192.0.2.255 scope global eth1
+designate-bind-2 | CHANGED | rc=0 >>
+    inet 192.0.2.12/24 brd 192.0.2.255 scope global eth1
+----
++
+[NOTE]
+====
+The exact network interface name may vary. Look for IPs on the External or Public network.
+====
+
+. Extract the RNDC key for BIND9 management:
++
+[source,bash]
+----
+$ ssh heat-admin@designate-bind-0 \
+  "sudo cat /var/lib/config-data/ansible-generated/designate/etc/rndc.key"
+key "rndc-key" {
+    algorithm hmac-sha256;
+    secret "base64-encoded-secret-here";
+};
+----
+
+. Extract the NS records configuration from the pools.yaml:
++
+[source,bash]
+----
+$ ssh heat-admin@designate-bind-0 \
+  "sudo cat /var/lib/config-data/ansible-generated/designate/etc/designate/pools.yaml"
+- name: default
+  description: Default BIND Pool
+  ns_records:
+    - hostname: ns1.example.com.
+      priority: 1
+    - hostname: ns2.example.com.
+      priority: 2
+    - hostname: ns3.example.com.
+      priority: 3
+----
+
+. Document the network configuration:
++
+* CIDR: `192.0.2.0/24`
+* BIND9 IPs: `192.0.2.10`, `192.0.2.11`, `192.0.2.12`
+* Number of BIND9 servers: `3`
+
+== Creating the NetworkAttachmentDefinition
+
+The NetworkAttachmentDefinition (NAD) configures the network for {dns_service} pods with predictable IP allocation. The OpenShift designate-operator allocates a pool of 25 IP addresses after the OpenShift pod IPAM range for BIND9 servers.
+
+.Procedure
+
+. Calculate the IP range allocation:
++
+[cols="1,3",options="header"]
+|===
+| Range | Purpose
+| 192.0.2.1 - 192.0.2.9 | OpenShift pod allocation (MDNS, Worker pods)
+| 192.0.2.10 - 192.0.2.34 | Predictable IP pool for BIND9 (25 addresses)
+| 192.0.2.35+ | Available for expansion
+|===
+
+. Create the NetworkAttachmentDefinition:
++
+[source,bash]
+----
+$ cat <<EOF | oc apply -f -
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: designate
+  namespace: openstack
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "bridge",
+      "bridge": "ospbr",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "192.0.2.0/24",
+        "range_start": "192.0.2.1",
+        "range_end": "192.0.2.9"
+      }
+    }
+EOF
+----
++
+[IMPORTANT]
+====
+* The `range_end` must be set so that BIND9 IPs (192.0.2.10-12) fall within the predictable IP pool
+* Adjust the bridge configuration based on your OpenShift network topology (may use macvlan, bridge, etc.)
+* Ensure the physical network interface on OpenShift worker nodes can reach this subnet
+====
+
+. Verify the NAD was created:
++
+[source,bash]
+----
+$ oc get network-attachment-definitions designate -n openstack
+NAME        AGE
+designate   5s
+----
+
+== Configuring the RNDC secret
+
+.Procedure
+
+. Store the RNDC key in the OpenStack secret:
++
+[source,bash]
+----
+$ oc set data secret/osp-secret \
+  "DesignateRndcKey=<base64-encoded-secret-from-step-2>"
+----
+
+. Verify the secret was updated:
++
+[source,bash]
+----
+$ oc get secret osp-secret -o jsonpath='{.data.DesignateRndcKey}' | base64 -d
+----
+
+== Deploying the {dns_service}
+
+.Procedure
+
+. Patch the `OpenStackControlPlane` CR to deploy {dns_service} with BIND9 backend and preserved IPs:
++
+[source,bash,subs="+quotes"]
+----
+$ oc patch openstackcontrolplane openstack --type=merge --patch '
+spec:
+  designate:
+    enabled: true
+    apiOverride:
+      route: {}
+    template:
+      databaseInstance: openstack
+      databaseAccount: designate
+      rabbitMqClusterName: rabbitmq
+      secret: osp-secret
+      serviceAccount: designate
+      serviceUser: designate
+      passwordSelectors:
+        database: DesignateDatabasePassword
+        service: DesignatePassword
+      designateAPI:
+        replicas: 1
+        override:
+          service:
+            internal:
+              metadata:
+                annotations:
+                  metallb.universe.tf/address-pool: internalapi
+                  metallb.universe.tf/allow-shared-ip: internalapi
+                  metallb.universe.tf/loadBalancerIPs: 172.17.0.80 <1>
+              spec:
+                type: LoadBalancer
+      designateCentral:
+        replicas: 1
+      designateWorker:
+        replicas: 1
+        networkAttachments:
+          - designate
+      designateMdns:
+        replicas: 1
+        networkAttachments:
+          - designate
+      designateProducer:
+        replicas: 1
+      designateBackendbind9:
+        replicas: 3 <2>
+        controlNetworkName: designate
+        storageClass: local-storage <3>
+        storageRequest: 1Gi
+        override:
+          services:
+            - name: designate-bind9-0
+              spec:
+                type: LoadBalancer
+                loadBalancerIP: 192.0.2.10 <4>
+            - name: designate-bind9-1
+              spec:
+                type: LoadBalancer
+                loadBalancerIP: 192.0.2.11
+            - name: designate-bind9-2
+              spec:
+                type: LoadBalancer
+                loadBalancerIP: 192.0.2.12
+      nsRecords:
+        - hostname: ns1.example.com. <5>
+          priority: 1
+        - hostname: ns2.example.com.
+          priority: 2
+        - hostname: ns3.example.com.
+          priority: 3
+'
+----
+<1> Adjust the InternalAPI IP to match your environment
+<2> Set replicas to match the number of BIND9 servers in TripleO deployment
+<3> Adjust storage class based on your cluster configuration
+<4> These IPs *must* match the exact IPs from the TripleO deployment
+<5> NS records should match the source deployment pools.yaml configuration
+
+. Wait for {dns_service} services to become ready:
++
+[source,bash]
+----
+$ oc wait pod --for condition=Ready \
+  --selector=service=designate,component=designate-api \
+  --timeout=600s
+
+$ oc wait pod --for condition=Ready \
+  --selector=service=designate,component=designate-central \
+  --timeout=600s
+
+$ oc wait pod --for condition=Ready \
+  --selector=service=designate,component=designate-worker \
+  --timeout=600s
+
+$ oc wait pod --for condition=Ready \
+  --selector=service=designate,component=designate-mdns \
+  --timeout=600s
+
+$ oc wait pod --for condition=Ready \
+  --selector=service=designate,component=designate-producer \
+  --timeout=600s
+
+$ oc wait pod --for condition=Ready \
+  --selector=service=designate,component=designate-backendbind9 \
+  --timeout=600s
+----
+
+. Verify that BIND9 pods have the correct IP addresses:
++
+[source,bash]
+----
+$ oc get pods -l component=designate-backendbind9 -o wide
+NAME                    READY   STATUS    IP            NODE
+designate-bind9-0       1/1     Running   192.0.2.10    worker-0
+designate-bind9-1       1/1     Running   192.0.2.11    worker-1
+designate-bind9-2       1/1     Running   192.0.2.12    worker-2
+----
+
+== Verifying the {dns_service} adoption
+
+.Procedure
+
+. Check that {dns_service} endpoints are registered:
++
+[source,bash]
+----
+$ oc exec -t openstackclient -- openstack endpoint list --service dns
++-------------+-----------+--------------+----------------+
+| ID          | Region    | Service Name | Service Type   |
++-------------+-----------+--------------+----------------+
+| 9c...       | regionOne | designate    | dns            |
++-------------+-----------+--------------+----------------+
+----
+
+. List existing DNS zones to verify database migration:
++
+[source,bash]
+----
+$ oc exec -t openstackclient -- openstack zone list
++--------------------------------------+--------------------+---------+
+| id                                   | name               | status  |
++--------------------------------------+--------------------+---------+
+| 12345678-1234-1234-1234-123456789012 | example.com.       | ACTIVE  |
++--------------------------------------+--------------------+---------+
+----
+
+. Verify that zones are accessible from BIND9 servers:
++
+[source,bash]
+----
+$ dig @192.0.2.10 example.com SOA +short
+ns1.example.com. admin.example.com. 2024010101 3600 600 86400 3600
+
+$ dig @192.0.2.11 example.com SOA +short
+ns1.example.com. admin.example.com. 2024010101 3600 600 86400 3600
+
+$ dig @192.0.2.12 example.com SOA +short
+ns1.example.com. admin.example.com. 2024010101 3600 600 86400 3600
+----
+
+. Create a test zone to verify zone transfers:
++
+[source,bash]
+----
+$ oc exec -t openstackclient -- openstack zone create \
+  --email admin@test.example.com test.example.com.
+
+$ sleep 10  # Wait for zone transfer
+
+$ dig @192.0.2.10 test.example.com SOA +short
+ns1.example.com. admin.test.example.com. ...
+----
+
+. Create a test record:
++
+[source,bash]
+----
+$ oc exec -t openstackclient -- openstack recordset create \
+  test.example.com. testrecord --type A --record 10.0.0.1
+
+$ sleep 5  # Wait for record propagation
+
+$ dig @192.0.2.10 testrecord.test.example.com A +short
+10.0.0.1
+----
+
+. Verify zone transfer logs in BIND9:
++
+[source,bash]
+----
+$ oc logs designate-bind9-0 | grep -i "transfer of"
+transfer of 'test.example.com/IN' from 192.0.2.5#5354: Transfer completed: 1 messages, 3 records
+----
+
+. Clean up test resources:
++
+[source,bash]
+----
+$ oc exec -t openstackclient -- openstack zone delete test.example.com.
+----
+
+== Post-adoption considerations
+
+After successful adoption, consider the following:
+
+*No external DNS changes required*: Because the BIND9 IP addresses are preserved, external DNS delegation (NS records and glue records) continues to work without modification.
+
+*Resolver configuration*: Unbound resolvers or other systems that reference BIND9 IPs directly continue to function without reconfiguration.
+
+*Monitoring zone transfers*: Monitor that all zones are successfully transferring from MDNS to all BIND9 replicas:
++
+[source,bash]
+----
+$ oc exec -t openstackclient -- openstack zone list
+# Verify all zones show status=ACTIVE
+# Check BIND9 logs for transfer messages
+----
+
+*Scale BIND9 if needed*: The StatefulSet can be scaled by adjusting the replicas:
++
+[source,bash]
+----
+$ oc patch openstackcontrolplane openstack --type=merge --patch '
+spec:
+  designate:
+    template:
+      designateBackendbind9:
+        replicas: 5
+'
+----
++
+[IMPORTANT]
+====
+When scaling BIND9, additional IPs will be allocated from the predictable IP pool (192.0.2.13, 192.0.2.14, etc.). Update external DNS delegation if these new servers should be publicly accessible.
+====
+
+*Decommission TripleO BIND9 servers*: Once you have verified that all zones are functioning correctly on the new deployment, you can safely decommission the TripleO BIND9 servers.
