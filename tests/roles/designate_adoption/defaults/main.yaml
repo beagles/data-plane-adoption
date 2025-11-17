@@ -1,4 +1,64 @@
 ---
+# Designate Adoption Defaults - Supports both ConfigMap and LoadBalancer approaches
+
+# ============================================================================
+# IP Preservation Strategy
+# ============================================================================
+
+# ConfigMap-based IP preservation (Recommended for production)
+# Uses OpenShift predictableips init container to assign secondary IPs to pods
+designate_bind_ip_preservation: true
+
+# LoadBalancer-based IP preservation (Alternative method)
+# Uses MetalLB to assign IPs via LoadBalancer services
+enable_designate_bind9: false
+
+# ============================================================================
+# Retry Configuration
+# ============================================================================
+
+# Retry configuration for Designate services
+designate_retry_delay: 5
+
+# ============================================================================
+# BIND9 Configuration
+# ============================================================================
+
+# BIND9 configuration - IPs will be extracted from source deployment
+designate_bind9_ips: []
+
+# NS records for the DNS zones - these should match the source deployment
+designate_ns_records:
+  - hostname: ns1.example.com.
+    priority: 1
+  - hostname: ns2.example.com.
+    priority: 2
+
+# Number of BIND9 replicas to deploy (should match source)
+designate_bind9_replicas: 3
+
+# ============================================================================
+# Storage Configuration
+# ============================================================================
+
+# Storage configuration for BIND9
+designate_bind9_storage_class: "{{ storage_class_name | default('') }}"  # Empty uses default
+designate_bind9_storage_request: "5Gi"
+
+# ============================================================================
+# TripleO Configuration Extraction
+# ============================================================================
+
+# Network used by BIND9 in TripleO (for IP extraction)
+tripleo_designate_bind_network: "external"
+
+# TripleO RC file path (for Heat stack queries)
+tripleo_rc_file: "~/stackrc"
+
+# ============================================================================
+# Designate OpenStackControlPlane Patch
+# ============================================================================
+
 designate_patch: |
   spec:
     designate:
@@ -35,3 +95,38 @@ designate_patch: |
           replicas: 1
         designateProducer:
           replicas: 1
+        {% if enable_designate_bind9|default(false) %}
+        # LoadBalancer approach - explicit IP configuration
+        designateBackendbind9:
+          replicas: {{ designate_bind9_replicas }}
+          storageClass: {{ designate_bind9_storage_class }}
+          storageRequest: {{ designate_bind9_storage_request }}
+          override:
+            services:
+              {% for i in range(designate_bind9_replicas) %}
+              - name: designate-bind9-{{ i }}
+                spec:
+                  type: LoadBalancer
+                  {% if designate_bind9_ips and designate_bind9_ips|length > i %}
+                  loadBalancerIP: {{ designate_bind9_ips[i] }}
+                  {% endif %}
+              {% endfor %}
+        {% elif designate_bind_ip_preservation|default(false) %}
+        # ConfigMap approach - dynamic replica count based on extracted IPs
+        designateBackendbind9:
+          replicas: {{ tripleo_bind9_ips | default([]) | length | default(3) }}
+          storageClass: {{ designate_bind9_storage_class | default('') }}
+          storageRequest: {{ designate_bind9_storage_request | default('5Gi') }}
+        {% endif %}
+        nsRecords:
+          {% if designate_ns_records is defined %}
+          {% for ns_record in designate_ns_records %}
+          - hostname: {{ ns_record.hostname }}
+            priority: {{ ns_record.priority }}
+          {% endfor %}
+          {% else %}
+          - hostname: ns1.example.com.
+            priority: 1
+          - hostname: ns2.example.com.
+            priority: 2
+          {% endif %}

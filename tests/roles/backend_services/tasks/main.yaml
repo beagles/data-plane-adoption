@@ -22,6 +22,9 @@
     {% if barbican_password %}
         oc set data secret/osp-secret "BarbicanPassword={{ barbican_password }}"
     {% endif %}
+    {% if designate_password %}
+        oc set data secret/osp-secret "DesignatePassword={{ designate_password }}"
+    {% endif %}
     {% if ceilometer_password %}
         oc set data secret/osp-secret "CeilometerPassword={{ ceilometer_password }}"
     {% endif %}

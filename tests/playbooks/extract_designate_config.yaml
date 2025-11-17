@@ -1,0 +1,212 @@
+---
+# Playbook to extract Designate configuration from TripleO deployment
+# This should be run BEFORE stopping TripleO services
+
+- name: Extract Designate Configuration from TripleO
+  hosts: local
+  gather_facts: false
+  module_defaults:
+    ansible.builtin.shell:
+      executable: /bin/bash
+  vars:
+    extract_bind_ips: true
+    extract_pools_yaml: true
+    extract_rndc_keys: true
+  tasks:
+    - name: Include common defaults
+      ansible.builtin.include_role:
+        name: common_defaults
+
+    - name: Extract BIND9 IP addresses
+      when: extract_bind_ips | bool
+      block:
+        - name: Get BIND9 server IPs
+          ansible.builtin.shell: |
+            {{ shell_header }}
+
+            # Try multiple methods to get BIND9 IPs
+
+            # Method 1: Direct query to BIND9 nodes
+            if ansible-inventory --list 2>/dev/null | grep -q "designate_bind"; then
+              echo "# Method 1: Querying designate_bind nodes" >&2
+              ansible -i {{ inventory_file | default('tests/inventory.yaml') }} designate_bind \
+                -m shell \
+                -a "ip -j addr show | jq -r '.[] | select(.ifname | contains(\"external\") or contains(\"public\")) | .addr_info[] | select(.family == \"inet\") | .local'" \
+                2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true
+            fi
+          register: bind_ips_method1
+          failed_when: false
+          delegate_to: localhost
+
+        - name: Get BIND9 IPs from Heat stack
+          ansible.builtin.shell: |
+            {{ shell_header }}
+
+            # Method 2: Heat stack outputs
+            if [ -f ~/stackrc ]; then
+              source ~/stackrc
+              openstack stack output show overcloud DesignateBindIPs -f json 2>/dev/null | \
+                jq -r '.output_value | if type == "array" then .[] else . end' || true
+            fi
+          register: bind_ips_method2
+          failed_when: false
+          delegate_to: localhost
+
+        - name: Get BIND9 IPs from pools.yaml
+          ansible.builtin.shell: |
+            {{ shell_header }}
+
+            # Method 3: Parse pools.yaml from controller
+            CONTROLLER="{{ groups['osp-controllers'][0] }}"
+
+            # Try to get from container
+            POOLS_CONTENT=$(ansible -i {{ inventory_file | default('tests/inventory.yaml') }} $CONTROLLER \
+              -m shell \
+              -a "sudo podman exec designate_worker cat /etc/designate/pools.yaml 2>/dev/null" \
+              2>/dev/null | grep -A 1000 '^overcloud' || \
+              ansible -i {{ inventory_file | default('tests/inventory.yaml') }} $CONTROLLER \
+              -m shell \
+              -a "cat /var/lib/config-data/puppet-generated/designate/etc/designate/pools.yaml" \
+              2>/dev/null | grep -A 1000 '^overcloud' || echo "")
+
+            if [ -n "$POOLS_CONTENT" ]; then
+              echo "$POOLS_CONTENT" | grep -oE 'host: [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | sort -u
+            fi
+          register: bind_ips_method3
+          failed_when: false
+          delegate_to: localhost
+
+        - name: Combine and deduplicate BIND9 IPs
+          ansible.builtin.set_fact:
+            all_bind_ips: >-
+              {{
+                (
+                  (bind_ips_method1.stdout_lines | default([]) | select('match', '^[0-9]+\.') | list) +
+                  (bind_ips_method2.stdout_lines | default([]) | select('match', '^[0-9]+\.') | list) +
+                  (bind_ips_method3.stdout_lines | default([]) | select('match', '^[0-9]+\.') | list)
+                ) | unique | sort
+              }}
+
+        - name: Display extracted BIND9 IPs
+          ansible.builtin.debug:
+            msg: |
+              Extracted BIND9 IP addresses:
+              {% for ip in all_bind_ips %}
+                - {{ ip }}
+              {% endfor %}
+
+              Total: {{ all_bind_ips | length }} IP(s)
+
+        - name: Save BIND9 IPs to file
+          ansible.builtin.copy:
+            content: |
+              # TripleO BIND9 IP addresses
+              # Extracted: {{ ansible_date_time.iso8601 }}
+              # Source: {{ inventory_file | default('tests/inventory.yaml') }}
+
+              tripleo_bind9_ips:
+              {% for ip in all_bind_ips %}
+                - "{{ ip }}"
+              {% endfor %}
+            dest: "{{ playbook_dir }}/../tripleo_bind9_ips.yaml"
+            mode: '0644'
+          delegate_to: localhost
+
+    - name: Extract pools.yaml configuration
+      when: extract_pools_yaml | bool
+      block:
+        - name: Get pools.yaml from TripleO
+          ansible.builtin.shell: |
+            {{ shell_header }}
+
+            CONTROLLER="{{ groups['osp-controllers'][0] }}"
+
+            # Try container first
+            ansible -i {{ inventory_file | default('tests/inventory.yaml') }} $CONTROLLER \
+              -m shell \
+              -a "sudo podman exec designate_worker cat /etc/designate/pools.yaml" \
+              2>/dev/null | grep -A 1000 '^-' || \
+            # Fallback to file system
+            ansible -i {{ inventory_file | default('tests/inventory.yaml') }} $CONTROLLER \
+              -m shell \
+              -a "cat /var/lib/config-data/puppet-generated/designate/etc/designate/pools.yaml" \
+              2>/dev/null | grep -A 1000 '^-'
+          register: pools_yaml_content
+          failed_when: false
+          delegate_to: localhost
+
+        - name: Save pools.yaml
+          ansible.builtin.copy:
+            content: |
+              # TripleO Designate pools.yaml
+              # Extracted: {{ ansible_date_time.iso8601 }}
+
+              {{ pools_yaml_content.stdout }}
+            dest: "{{ playbook_dir }}/../tripleo_designate_pools.yaml"
+            mode: '0644'
+          delegate_to: localhost
+          when: pools_yaml_content.rc == 0
+
+    - name: Extract RNDC keys
+      when: extract_rndc_keys | bool
+      block:
+        - name: Get RNDC key from TripleO
+          ansible.builtin.shell: |
+            {{ shell_header }}
+
+            # Try to get from designate_bind nodes
+            if ansible-inventory --list 2>/dev/null | grep -q "designate_bind"; then
+              ansible -i {{ inventory_file | default('tests/inventory.yaml') }} designate_bind[0] \
+                -m shell \
+                -a "cat /etc/rndc.key" \
+                2>/dev/null | grep -A 10 'key "rndc-key"'
+            else
+              # Try from controller
+              CONTROLLER="{{ groups['osp-controllers'][0] }}"
+              ansible -i {{ inventory_file | default('tests/inventory.yaml') }} $CONTROLLER \
+                -m shell \
+                -a "cat /var/lib/config-data/puppet-generated/designate/etc/rndc.key" \
+                2>/dev/null
+            fi
+          register: rndc_key_content
+          failed_when: false
+          delegate_to: localhost
+
+        - name: Save RNDC key
+          ansible.builtin.copy:
+            content: |
+              # TripleO Designate RNDC Key
+              # Extracted: {{ ansible_date_time.iso8601 }}
+              # WARNING: This file contains sensitive information
+
+              {{ rndc_key_content.stdout }}
+            dest: "{{ playbook_dir }}/../tripleo_rndc_key.conf"
+            mode: '0600'
+          delegate_to: localhost
+          when: rndc_key_content.rc == 0
+
+    - name: Summary of extracted configuration
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          DESIGNATE CONFIGURATION EXTRACTION COMPLETE
+          ========================================
+
+          Extracted files:
+          {% if extract_bind_ips %}
+            ✓ BIND9 IPs: {{ playbook_dir }}/../tripleo_bind9_ips.yaml ({{ all_bind_ips | length }} IPs)
+          {% endif %}
+          {% if extract_pools_yaml and pools_yaml_content.rc == 0 %}
+            ✓ Pools configuration: {{ playbook_dir }}/../tripleo_designate_pools.yaml
+          {% endif %}
+          {% if extract_rndc_keys and rndc_key_content.rc == 0 %}
+            ✓ RNDC key: {{ playbook_dir }}/../tripleo_rndc_key.conf
+          {% endif %}
+
+          Next steps:
+          1. Review extracted configuration files
+          2. Create designate-bind-ip-configmap.yaml with extracted IPs
+          3. Run designate adoption playbook
+
+          ========================================
+

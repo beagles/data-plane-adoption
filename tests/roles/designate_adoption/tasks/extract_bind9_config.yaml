@@ -1,0 +1,79 @@
+---
+# Extract BIND9 configuration from TripleO deployment
+# This tasks file extracts the IPs, network configuration, and RNDC keys
+# from the source TripleO Designate deployment
+
+- name: Check if designate_bind group exists in inventory
+  ansible.builtin.set_fact:
+    has_designate_bind: "{{ groups['designate_bind'] is defined and groups['designate_bind']|length > 0 }}"
+
+- name: Extract BIND9 IPs from TripleO deployment
+  when: has_designate_bind|bool
+  block:
+    - name: Get BIND9 server IPs from external network
+      ansible.builtin.shell: |
+        {{ shell_header }}
+        ssh {{ hostvars[item]['ansible_host'] }} \
+          "ip -4 addr show | grep -oP '(?<=inet\s){{ external_network_cidr | regex_replace('/.*', '') }}[0-9.]+' | head -1"
+      loop: "{{ groups['designate_bind'] }}"
+      register: bind9_ip_results
+      changed_when: false
+
+    - name: Set BIND9 IPs fact
+      ansible.builtin.set_fact:
+        designate_bind9_ips: "{{ bind9_ip_results.results | map(attribute='stdout') | list }}"
+
+    - name: Display extracted BIND9 IPs
+      ansible.builtin.debug:
+        msg: "Extracted BIND9 IPs: {{ designate_bind9_ips }}"
+
+    - name: Get network configuration from first BIND9 server
+      ansible.builtin.shell: |
+        {{ shell_header }}
+        ssh {{ hostvars[groups['designate_bind'][0]]['ansible_host'] }} \
+          "ip -4 addr show | grep '{{ designate_bind9_ips[0] }}'"
+      register: bind9_network_info
+      changed_when: false
+
+    - name: Extract CIDR from network info
+      ansible.builtin.set_fact:
+        designate_bind9_network_cidr: "{{ bind9_network_info.stdout | regex_search('([0-9.]+/[0-9]+)', '\\1') | first }}"
+
+    - name: Extract RNDC key from source deployment
+      ansible.builtin.shell: |
+        {{ shell_header }}
+        {{ oc_header }}
+        RNDC_KEY=$(ssh {{ hostvars[groups['designate_bind'][0]]['ansible_host'] }} \
+          "sudo cat /var/lib/config-data/ansible-generated/designate/etc/rndc.key" | \
+          grep -oP '(?<=secret ")[^"]+')
+        oc set data secret/osp-secret "DesignateRndcKey=$RNDC_KEY"
+      register: rndc_key_result
+      changed_when: rndc_key_result.rc == 0
+
+    - name: Extract NS records from Designate pools configuration
+      ansible.builtin.shell: |
+        {{ shell_header }}
+        ssh {{ hostvars[groups['designate_bind'][0]]['ansible_host'] }} \
+          "sudo python3 -c \"
+import yaml
+with open('/var/lib/config-data/ansible-generated/designate/etc/designate/pools.yaml', 'r') as f:
+    pools = yaml.safe_load(f)
+    for pool in pools:
+        if 'ns_records' in pool:
+            for ns in pool['ns_records']:
+                print(f\\\"{ns['hostname']}:{ns.get('priority', 1)}\\\")
+        break
+\""
+      register: ns_records_result
+      changed_when: false
+      failed_when: false
+
+    - name: Parse NS records
+      ansible.builtin.set_fact:
+        designate_ns_records: "{{ ns_records_result.stdout_lines | map('regex_replace', '^(.+):([0-9]+)$', '{\"hostname\": \"\\1\", \"priority\": \\2}') | map('from_json') | list }}"
+      when: ns_records_result.stdout_lines is defined and ns_records_result.stdout_lines|length > 0
+
+- name: Use default configuration if no TripleO BIND9 deployment found
+  when: not has_designate_bind|bool
+  ansible.builtin.debug:
+    msg: "No designate_bind group found in inventory. Using default configuration from defaults/main.yaml"

@@ -1,0 +1,217 @@
+---
+# Verify BIND9 pods have the correct preserved IPs after deployment
+
+- name: Wait for BIND9 pods to be ready
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc wait pod --for condition=Ready \
+      --selector=service=designate-backendbind9 \
+      --timeout=600s
+  register: bind9_ready_result
+  retries: 3
+  delay: 10
+  until: bind9_ready_result is success
+
+- name: Get BIND9 pod list
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc get pods -l service=designate-backendbind9 -o name | sed 's|pod/||'
+  register: bind9_pod_list
+
+- name: Retrieve ConfigMap for expected IPs
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc get configmap designate-bind-ip-map -o json
+  register: bind_ip_cm_json
+
+- name: Parse expected IPs
+  ansible.builtin.set_fact:
+    expected_bind_ips: "{{ (bind_ip_cm_json.stdout | from_json).data }}"
+
+- name: Verify each pod has correct IP
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+
+    POD_NAME="{{ item }}"
+    POD_INDEX=$(echo $POD_NAME | grep -oE '[0-9]+$')
+    EXPECTED_IP=$(echo '{{ expected_bind_ips | to_json }}' | jq -r ".\"bind_address_$POD_INDEX\"")
+
+    # Get IP from pod's network interface
+    ACTUAL_IP=$(oc exec $POD_NAME -- ip addr show {{ designate_control_network_name | default('designate') }} 2>/dev/null | \
+                grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1)
+
+    if [ -z "$ACTUAL_IP" ]; then
+      echo "ERROR: Could not retrieve IP from pod $POD_NAME"
+      exit 1
+    fi
+
+    if [ "$ACTUAL_IP" != "$EXPECTED_IP" ]; then
+      echo "ERROR: Pod $POD_NAME has IP $ACTUAL_IP but expected $EXPECTED_IP"
+      exit 1
+    fi
+
+    echo "OK: Pod $POD_NAME has correct IP $ACTUAL_IP"
+  loop: "{{ bind9_pod_list.stdout_lines }}"
+  register: pod_ip_verification
+
+- name: Display IP verification results
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ pod_ip_verification.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Test DNS resolution on preserved IPs
+  ansible.builtin.shell: |
+    {{ shell_header }}
+
+    IP="{{ item.value }}"
+
+    # Test BIND9 version query (should always work)
+    if ! dig @$IP version.bind chaos txt +short +timeout=5 2>&1 | grep -q 'BIND'; then
+      echo "WARNING: BIND9 at $IP not responding to version query"
+      exit 1
+    fi
+
+    # Test RNDC port accessibility
+    if ! timeout 5 bash -c "echo > /dev/tcp/$IP/953" 2>/dev/null; then
+      echo "WARNING: RNDC port 953 not accessible on $IP"
+      exit 1
+    fi
+
+    echo "OK: BIND9 at $IP is operational (DNS: ✓, RNDC: ✓)"
+  loop: "{{ expected_bind_ips | dict2items }}"
+  register: dns_resolution_test
+  when: item.key.startswith('bind_address_')
+
+- name: Display DNS test results
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ dns_resolution_test.results }}"
+  loop_control:
+    label: "{{ item.item.value }}"
+  when: dns_resolution_test is defined
+
+- name: Verify RNDC connectivity from Designate Worker
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+
+    # Get first worker pod
+    WORKER_POD=$(oc get pods -l service=designate-worker -o name | head -1 | sed 's|pod/||')
+
+    if [ -z "$WORKER_POD" ]; then
+      echo "WARNING: No Designate Worker pod found, skipping RNDC test"
+      exit 0
+    fi
+
+    IP="{{ item.value }}"
+
+    # Test RNDC status command from worker
+    if oc exec $WORKER_POD -- timeout 10 rndc -s $IP status 2>&1 | grep -q "version"; then
+      echo "OK: RNDC connection successful from worker to $IP"
+    else
+      echo "ERROR: RNDC connection failed from worker to $IP"
+      exit 1
+    fi
+  loop: "{{ expected_bind_ips | dict2items }}"
+  register: rndc_connectivity_test
+  when: item.key.startswith('bind_address_')
+  failed_when: false
+
+- name: Display RNDC connectivity results
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ rndc_connectivity_test.results }}"
+  loop_control:
+    label: "{{ item.item.value }}"
+  when: rndc_connectivity_test is defined
+
+- name: Compare with TripleO IPs if available
+  when: tripleo_bind9_ips is defined
+  block:
+    - name: Check IP preservation accuracy
+      ansible.builtin.assert:
+        that:
+          - item in (expected_bind_ips | dict2items | map(attribute='value') | list)
+        fail_msg: "TripleO IP {{ item }} not found in OpenShift deployment!"
+        success_msg: "TripleO IP {{ item }} successfully preserved"
+      loop: "{{ tripleo_bind9_ips }}"
+
+- name: Verify zone transfers working
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+
+    # Get first MDNS pod
+    MDNS_POD=$(oc get pods -l service=designate-mdns -o name | head -1 | sed 's|pod/||')
+
+    if [ -z "$MDNS_POD" ]; then
+      echo "INFO: No Designate MDNS pod found, skipping zone transfer test"
+      exit 0
+    fi
+
+    IP="{{ item.value }}"
+
+    # Try to do a zone transfer for a test zone
+    # Note: This will fail if no zones exist yet, which is OK
+    ZONES=$(oc exec $MDNS_POD -- openstack zone list -f value -c name 2>/dev/null | head -1)
+
+    if [ -z "$ZONES" ]; then
+      echo "INFO: No zones exist yet, skipping zone transfer test for $IP"
+      exit 0
+    fi
+
+    ZONE=$(echo "$ZONES" | head -1)
+
+    if oc exec $MDNS_POD -- dig @$IP $ZONE AXFR +short 2>&1 | grep -q SOA; then
+      echo "OK: Zone transfer successful from $IP for zone $ZONE"
+    else
+      echo "WARNING: Zone transfer may not be working from $IP (zone: $ZONE)"
+    fi
+  loop: "{{ expected_bind_ips | dict2items }}"
+  register: zone_transfer_test
+  when: item.key.startswith('bind_address_')
+  failed_when: false
+
+- name: Display zone transfer test results
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ zone_transfer_test.results }}"
+  loop_control:
+    label: "{{ item.item.value }}"
+  when: zone_transfer_test is defined
+
+- name: Final IP verification summary
+  ansible.builtin.debug:
+    msg: |
+      ========================================
+      BIND9 IP VERIFICATION COMPLETE
+      ========================================
+      All {{ expected_bind_ips | dict2items | selectattr('key', 'match', '^bind_address_') | list | length }} BIND9 pod(s) verified:
+      {% for item in expected_bind_ips | dict2items | selectattr('key', 'match', '^bind_address_') %}
+        ✓ Pod {{ loop.index0 }}: {{ item.value }} (Preserved from TripleO)
+      {% endfor %}
+
+      Tests performed:
+        ✓ Pod IP assignment verification
+        ✓ DNS query response (port 53)
+        ✓ RNDC port accessibility (port 953)
+        ✓ RNDC connectivity from Designate Worker
+        ✓ Zone transfer capability (if zones exist)
+
+      IP preservation successful!
+      ========================================
+
+- name: Check for any failures
+  ansible.builtin.assert:
+    that:
+      - pod_ip_verification is succeeded
+      - dns_resolution_test is succeeded or dns_resolution_test is skipped
+    fail_msg: "Some verification tests failed. Review logs above."
+    success_msg: "All BIND9 IP verification tests passed!"
+

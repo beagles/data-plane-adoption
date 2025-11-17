@@ -1,20 +1,141 @@
-- name: deploy podified Designate
+---
+# Designate Adoption Tasks - Extract configuration from TripleO and deploy to OpenShift
+
+# ============================================================================
+# Pre-Deployment: Extract Configuration from TripleO
+# ============================================================================
+
+- name: Extract BIND9 IPs from TripleO (ConfigMap approach)
+  ansible.builtin.include_tasks: extract_bind_ips.yaml
+  when:
+    - designate_bind_ip_preservation | default(false) | bool
+    - tripleo_bind9_ips is not defined
+  tags:
+    - extract_bind_ips
+
+- name: Preserve BIND9 IPs in ConfigMap
+  ansible.builtin.include_tasks: preserve_bind_ips.yaml
+  when:
+    - designate_bind_ip_preservation | default(false) | bool
+    - tripleo_bind9_ips is defined
+  tags:
+    - preserve_bind_ips
+
+- name: Extract BIND9 configuration from source deployment (LoadBalancer approach)
+  when:
+    - not (designate_bind_ip_preservation | default(false) | bool)
+    - enable_designate_bind9 | default(false)
+  ansible.builtin.include_tasks: extract_bind9_config.yaml
+  tags:
+    - extract_bind9_config
+
+# ============================================================================
+# Deploy Designate
+# ============================================================================
+
+- name: Deploy podified Designate
   ansible.builtin.shell: |
     {{ shell_header }}
     {{ oc_header }}
     oc patch openstackcontrolplane openstack --type=merge --patch '{{ designate_patch }}'
+  tags:
+    - deploy_designate
 
-- name: wait for Designate to start up
+# ============================================================================
+# Pod Readiness Checks - Granular per-component waiting
+# Useful for debugging and understanding which component is failing
+# ============================================================================
+
+- name: Wait for Designate API to start up
   ansible.builtin.shell: |
     {{ shell_header }}
     {{ oc_header }}
-    oc wait pod --for condition=Ready --selector=service=designate
-  register: designate_running_result
-  until: designate_running_result is success
-  retries: 180
-  delay: 2
+    oc wait pod --for condition=Ready --selector=service=designate,component=designate-api --timeout=600s
+  register: designate_api_running_result
+  until: designate_api_running_result is success
+  retries: 60
+  delay: "{{ designate_retry_delay | default(5) }}"
+  tags:
+    - wait_for_designate
 
-- name: check that Designate is reachable and its endpoints are defined
+- name: Wait for Designate Central to start up
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc wait pod --for condition=Ready --selector=service=designate,component=designate-central --timeout=600s
+  register: designate_central_running_result
+  until: designate_central_running_result is success
+  retries: 60
+  delay: "{{ designate_retry_delay | default(5) }}"
+  tags:
+    - wait_for_designate
+
+- name: Wait for Designate Worker to start up
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc wait pod --for condition=Ready --selector=service=designate,component=designate-worker --timeout=600s
+  register: designate_worker_running_result
+  until: designate_worker_running_result is success
+  retries: 60
+  delay: "{{ designate_retry_delay | default(5) }}"
+  tags:
+    - wait_for_designate
+
+- name: Wait for Designate MDNS to start up
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc wait pod --for condition=Ready --selector=service=designate,component=designate-mdns --timeout=600s
+  register: designate_mdns_running_result
+  until: designate_mdns_running_result is success
+  retries: 60
+  delay: "{{ designate_retry_delay | default(5) }}"
+  tags:
+    - wait_for_designate
+
+- name: Wait for Designate Producer to start up
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc wait pod --for condition=Ready --selector=service=designate,component=designate-producer --timeout=600s
+  register: designate_producer_running_result
+  until: designate_producer_running_result is success
+  retries: 60
+  delay: "{{ designate_retry_delay | default(5) }}"
+  tags:
+    - wait_for_designate
+
+- name: Wait for Designate BIND9 to start up
+  when: enable_designate_bind9 | default(false) or (tripleo_bind9_ips is defined and tripleo_bind9_ips | length > 0)
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc wait pod --for condition=Ready --selector=service=designate,component=designate-backendbind9 --timeout=600s
+  register: designate_bind9_running_result
+  until: designate_bind9_running_result is success
+  retries: 60
+  delay: "{{ designate_retry_delay | default(5) }}"
+  tags:
+    - wait_for_designate
+
+# ============================================================================
+# Verification - IP Preservation (ConfigMap approach)
+# ============================================================================
+
+- name: Verify BIND9 IPs preserved correctly (ConfigMap approach)
+  ansible.builtin.include_tasks: verify_bind_ips.yaml
+  when:
+    - designate_bind_ip_preservation | default(false) | bool
+    - tripleo_bind9_ips is defined
+  tags:
+    - verify_bind_ips
+
+# ============================================================================
+# Verification - Service Endpoints and Connectivity
+# ============================================================================
+
+- name: Check that Designate is reachable and its endpoints are defined
   ansible.builtin.shell: |
     {{ shell_header }}
     {{ oc_header }}
@@ -26,10 +147,43 @@
   register: designate_responding_result
   until: designate_responding_result is success
   retries: 60
-  delay: 2
+  delay: "{{ designate_retry_delay | default(5) }}"
+  tags:
+    - verify_designate
 
-- name: verify Designate functionality with test zone creation
-  when: test_designate_functionality|default(false)
+- name: Verify BIND9 servers are accessible (LoadBalancer approach)
+  when:
+    - not (designate_bind_ip_preservation | default(false) | bool)
+    - enable_designate_bind9 | default(false)
+    - designate_bind9_ips | length > 0
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    # Test DNS query to each BIND9 server
+    for bind_ip in {{ designate_bind9_ips | join(' ') }}; do
+      echo "Testing BIND9 server at $bind_ip"
+      timeout 5 dig @$bind_ip SOA . || echo "Warning: BIND9 at $bind_ip not responding yet"
+    done
+  register: bind9_connectivity_result
+  changed_when: false
+  failed_when: false
+  tags:
+    - verify_designate
+
+- name: Display BIND9 connectivity results (LoadBalancer approach)
+  when:
+    - not (designate_bind_ip_preservation | default(false) | bool)
+    - enable_designate_bind9 | default(false)
+  ansible.builtin.debug:
+    var: bind9_connectivity_result.stdout_lines
+  tags:
+    - verify_designate
+
+# ============================================================================
+# Functional Testing - Zone Creation
+# ============================================================================
+
+- name: Verify Designate functionality with test zone creation
+  when: test_designate_functionality | default(false)
   ansible.builtin.shell: |
     {{ shell_header }}
     {{ oc_header }}
@@ -39,13 +193,43 @@
     zone_name="test-adoption-{{ ansible_date_time.epoch }}.example.com."
     ${BASH_ALIASES[openstack]} zone create --email test@example.com $zone_name
 
+    # Wait for zone to become ACTIVE
+    timeout=60
+    while [ $timeout -gt 0 ]; do
+      zone_status=$(${BASH_ALIASES[openstack]} zone show $zone_name -f value -c status)
+      if [ "$zone_status" = "ACTIVE" ]; then
+        echo "Zone is ACTIVE"
+        break
+      fi
+      echo "Waiting for zone to become ACTIVE (current: $zone_status)..."
+      sleep 2
+      timeout=$((timeout - 2))
+    done
+
     # Verify zone was created
-    zone_status=$(${BASH_ALIASES[openstack]} zone show $zone_name -f value -c status)
-    if [ "$zone_status" != "ACTIVE" ] && [ "$zone_status" != "PENDING" ]
-    then
+    if [ "$zone_status" != "ACTIVE" ] && [ "$zone_status" != "PENDING" ]; then
       echo "Zone creation failed. Status: $zone_status"
       exit 1
     fi
 
+    {% if enable_designate_bind9|default(false) and designate_bind9_ips|length > 0 %}
+    # Verify zone is served by BIND9 servers (LoadBalancer approach)
+    for bind_ip in {{ designate_bind9_ips | join(' ') }}; do
+      echo "Checking zone $zone_name on BIND9 server $bind_ip"
+      dig @$bind_ip $zone_name SOA +short || echo "Warning: Zone not yet on $bind_ip"
+    done
+    {% endif %}
+
+    {% if designate_bind_ip_preservation|default(false) and tripleo_bind9_ips is defined %}
+    # Verify zone is served by BIND9 servers (ConfigMap approach)
+    for bind_ip in {{ tripleo_bind9_ips | join(' ') }}; do
+      echo "Checking zone $zone_name on BIND9 server $bind_ip"
+      dig @$bind_ip $zone_name SOA +short || echo "Warning: Zone not yet on $bind_ip"
+    done
+    {% endif %}
+
     # Clean up test zone
     ${BASH_ALIASES[openstack]} zone delete $zone_name
+  register: zone_creation_result
+  tags:
+    - test_designate

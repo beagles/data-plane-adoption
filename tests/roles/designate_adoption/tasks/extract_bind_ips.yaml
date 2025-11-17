@@ -1,0 +1,118 @@
+---
+# Extract BIND9 IP addresses from TripleO deployment
+# This task should be run BEFORE stopping TripleO services
+
+- name: Check if we need to preserve BIND9 IPs
+  ansible.builtin.set_fact:
+    preserve_bind9_ips: "{{ designate_bind_ip_preservation | default(true) }}"
+
+- name: Extract BIND9 server IPs from TripleO deployment
+  when: preserve_bind9_ips | bool
+  block:
+    - name: Get BIND9 node IPs from TripleO
+      ansible.builtin.shell: |
+        {{ shell_header }}
+
+        # Check if designate_bind group exists in inventory
+        if ! ansible-inventory --list | grep -q "designate_bind"; then
+          echo "WARNING: No designate_bind group in inventory" >&2
+          echo "[]"
+          exit 0
+        fi
+
+        # Extract IPs from running BIND9 services
+        ansible -i {{ inventory_file | default('inventory.yaml') }} designate_bind \
+          -m shell \
+          -a "ip -j addr show | jq -r '.[] | select(.ifname | contains(\"{{ tripleo_designate_bind_network | default('external') }}\")) | .addr_info[] | select(.family == \"inet\") | .local'" \
+          --one-line 2>/dev/null | awk '{print $NF}' | grep -E '^[0-9]+\.' || echo "[]"
+      register: tripleo_bind9_ips_raw
+      failed_when: false
+      delegate_to: localhost
+
+    - name: Parse BIND9 IPs
+      ansible.builtin.set_fact:
+        tripleo_bind9_ips: "{{ tripleo_bind9_ips_raw.stdout_lines | select('match', '^[0-9]+\\.') | list }}"
+
+    - name: Display extracted BIND9 IPs
+      ansible.builtin.debug:
+        msg: "Found {{ tripleo_bind9_ips | length }} BIND9 IP(s): {{ tripleo_bind9_ips }}"
+
+    - name: Verify we have expected number of IPs
+      ansible.builtin.assert:
+        that:
+          - tripleo_bind9_ips | length > 0
+          - tripleo_bind9_ips | length <= 32
+        fail_msg: "Invalid number of BIND9 IPs: {{ tripleo_bind9_ips | length }}"
+        success_msg: "Extracted {{ tripleo_bind9_ips | length }} BIND9 IP(s) for migration"
+
+    - name: Alternative: Extract from TripleO Heat outputs
+      when: tripleo_bind9_ips | length == 0
+      block:
+        - name: Get BIND9 IPs from Heat stack outputs
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            source {{ tripleo_rc_file | default('~/stackrc') }}
+
+            openstack stack output show overcloud DesignateBindIPs -f json 2>/dev/null | \
+              jq -r '.output_value | if type == "array" then .[] else . end'
+          register: heat_bind9_ips
+          failed_when: false
+
+        - name: Set BIND9 IPs from Heat
+          ansible.builtin.set_fact:
+            tripleo_bind9_ips: "{{ heat_bind9_ips.stdout_lines | select('match', '^[0-9]+\\.') | list }}"
+          when: heat_bind9_ips.rc == 0
+
+    - name: Alternative: Extract from Designate pools.yaml
+      when: tripleo_bind9_ips | length == 0
+      block:
+        - name: Read pools.yaml from TripleO Designate
+          ansible.builtin.shell: |
+            {{ shell_header }}
+
+            # Try to get pools.yaml from designate-worker container
+            CONTAINER_ID=$(sudo podman ps --filter "name=designate-worker" --format "{{ '{{' }}.ID{{ '}}' }}" | head -1)
+            if [ -n "$CONTAINER_ID" ]; then
+              sudo podman exec $CONTAINER_ID cat /etc/designate/pools.yaml
+            else
+              cat /var/lib/config-data/puppet-generated/designate/etc/designate/pools.yaml
+            fi
+          delegate_to: "{{ groups['osp-controllers'][0] }}"
+          register: pools_yaml_content
+          failed_when: false
+
+        - name: Parse BIND9 IPs from pools.yaml
+          ansible.builtin.set_fact:
+            tripleo_bind9_ips: "{{ pools_yaml_content.stdout | from_yaml | json_query('pools[0].targets[*].options.host') | unique }}"
+          when:
+            - pools_yaml_content.rc == 0
+            - pools_yaml_content.stdout | length > 0
+
+    - name: Save BIND9 IPs to file for reference
+      ansible.builtin.copy:
+        content: |
+          # TripleO BIND9 IP addresses extracted for adoption
+          # Extracted: {{ ansible_date_time.iso8601 }}
+          tripleo_bind9_ips:
+          {% for ip in tripleo_bind9_ips %}
+            - {{ ip }}
+          {% endfor %}
+        dest: "{{ playbook_dir }}/tripleo_bind9_ips.yaml"
+        mode: '0644'
+      delegate_to: localhost
+
+    - name: Display IP preservation notice
+      ansible.builtin.debug:
+        msg: |
+          ========================================
+          BIND9 IP PRESERVATION
+          ========================================
+          Extracted {{ tripleo_bind9_ips | length }} BIND9 IP address(es) from TripleO:
+          {% for ip in tripleo_bind9_ips %}
+            - {{ ip }}
+          {% endfor %}
+
+          These IPs will be preserved in the OpenShift deployment.
+          ConfigMap 'designate-bind-ip-map' will be created with these mappings.
+          ========================================
+

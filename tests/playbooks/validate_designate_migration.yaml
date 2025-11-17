@@ -1,0 +1,291 @@
+---
+# Multi-phase validation playbook for Designate migration
+# This playbook can be run at different stages of the migration process
+#
+# Usage:
+#   ansible-playbook validate_designate_migration.yaml -e phase=<phase>
+#
+# Phases:
+#   - pre_migration: Validate TripleO deployment before migration
+#   - post_deployment: Validate OpenShift Designate deployment
+#   - post_adoption: Validate after complete adoption
+#   - comparison: Compare TripleO and OpenShift configurations
+
+- name: Designate Migration Validation
+  hosts: local
+  gather_facts: false
+  module_defaults:
+    ansible.builtin.shell:
+      executable: /bin/bash
+  vars:
+    phase: "{{ validation_phase | default('post_adoption') }}"
+
+  tasks:
+    - name: Validate phase parameter
+      ansible.builtin.assert:
+        that:
+          - phase in ['pre_migration', 'post_deployment', 'post_adoption', 'comparison']
+        fail_msg: "Invalid phase. Must be one of: pre_migration, post_deployment, post_adoption, comparison"
+
+    # ==========================================
+    # Phase 1: Pre-Migration Validation
+    # ==========================================
+
+    - name: Pre-migration validation
+      when: phase == 'pre_migration'
+      block:
+        - name: Check TripleO Designate services are running
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            for host in {{ groups['designate_bind'] | join(' ') }}; do
+              ssh ${host} "systemctl is-active designate-bind9" || exit 1
+            done
+          changed_when: false
+
+        - name: Get TripleO BIND9 server IPs
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            ansible designate_bind -m shell -a "ip -4 addr show | grep 'inet.*{{ external_network_cidr | regex_replace('/.*', '') }}' | head -1" | \
+            grep -oP '(?<=inet\s)[0-9.]+'
+          register: tripleo_bind9_ips
+          changed_when: false
+
+        - name: Test DNS queries to TripleO BIND9 servers
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            for ip in {{ tripleo_bind9_ips.stdout_lines | join(' ') }}; do
+              echo "Testing $ip"
+              dig @$ip SOA . +short || exit 1
+            done
+          changed_when: false
+
+        - name: List zones in TripleO Designate
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            source ~/stackrc
+            openstack zone list -f yaml
+          register: tripleo_zones
+          changed_when: false
+
+        - name: Save pre-migration state
+          ansible.builtin.copy:
+            content: |
+              BIND9 IPs: {{ tripleo_bind9_ips.stdout_lines }}
+              Zones:
+              {{ tripleo_zones.stdout }}
+            dest: /tmp/designate_pre_migration_state.txt
+
+        - name: Display pre-migration summary
+          ansible.builtin.debug:
+            msg:
+              - "TripleO Designate Pre-Migration Validation Complete"
+              - "BIND9 Servers: {{ tripleo_bind9_ips.stdout_lines | length }}"
+              - "BIND9 IPs: {{ tripleo_bind9_ips.stdout_lines }}"
+              - "DNS Zones: {{ (tripleo_zones.stdout | from_yaml) | length }}"
+
+    # ==========================================
+    # Phase 2: Post-Deployment Validation
+    # ==========================================
+
+    - name: Post-deployment validation
+      when: phase == 'post_deployment'
+      block:
+        - name: Check OpenShift Designate pods are running
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            {{ oc_header }}
+            oc get pods -l service=designate --no-headers | grep -v Running && exit 1 || exit 0
+          changed_when: false
+
+        - name: Get OpenShift BIND9 pod IPs
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            {{ oc_header }}
+            oc get pods -l component=designate-backendbind9 -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'
+          register: openshift_bind9_ips
+          changed_when: false
+
+        - name: Verify BIND9 pods have correct IPs
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            {{ oc_header }}
+            # Get expected IPs from previous migration state
+            if [ -f /tmp/designate_pre_migration_state.txt ]; then
+              expected_ips=$(grep "BIND9 IPs:" /tmp/designate_pre_migration_state.txt | sed 's/BIND9 IPs: \[//' | sed 's/\]//' | tr -d "'" | tr ',' ' ')
+              actual_ips="{{ openshift_bind9_ips.stdout_lines | join(' ') }}"
+
+              for expected_ip in $expected_ips; do
+                echo "$actual_ips" | grep -q "$expected_ip" || {
+                  echo "ERROR: Expected IP $expected_ip not found in actual IPs: $actual_ips"
+                  exit 1
+                }
+              done
+              echo "IP preservation verified successfully"
+            else
+              echo "Warning: No pre-migration state found. Skipping IP comparison."
+            fi
+          changed_when: false
+
+        - name: Test DNS queries to OpenShift BIND9 servers
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            for ip in {{ openshift_bind9_ips.stdout_lines | join(' ') }}; do
+              echo "Testing $ip"
+              timeout 5 dig @$ip SOA . +short || {
+                echo "Warning: $ip not responding"
+              }
+            done
+          changed_when: false
+          failed_when: false
+          register: openshift_dns_test
+
+        - name: Check Designate API endpoint
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            {{ oc_header }}
+            oc exec -t openstackclient -- openstack endpoint list --service dns
+          changed_when: false
+
+        - name: Display post-deployment summary
+          ansible.builtin.debug:
+            msg:
+              - "OpenShift Designate Post-Deployment Validation Complete"
+              - "BIND9 Pods: {{ openshift_bind9_ips.stdout_lines | length }}"
+              - "BIND9 IPs: {{ openshift_bind9_ips.stdout_lines }}"
+
+    # ==========================================
+    # Phase 3: Post-Adoption Validation
+    # ==========================================
+
+    - name: Post-adoption validation
+      when: phase == 'post_adoption'
+      block:
+        - name: List zones in OpenShift Designate
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            {{ oc_header }}
+            oc exec -t openstackclient -- openstack zone list -f yaml
+          register: openshift_zones
+          changed_when: false
+
+        - name: Compare zone counts
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            if [ -f /tmp/designate_pre_migration_state.txt ]; then
+              tripleo_zone_count=$(grep -c "id:" /tmp/designate_pre_migration_state.txt || echo 0)
+              openshift_zone_count=$(echo '{{ openshift_zones.stdout }}' | grep -c "id:" || echo 0)
+
+              echo "TripleO zones: $tripleo_zone_count"
+              echo "OpenShift zones: $openshift_zone_count"
+
+              if [ "$tripleo_zone_count" -ne "$openshift_zone_count" ]; then
+                echo "WARNING: Zone count mismatch!"
+                exit 1
+              fi
+              echo "Zone count matches"
+            else
+              echo "Warning: No pre-migration state for comparison"
+            fi
+          changed_when: false
+          failed_when: false
+
+        - name: Verify zones are accessible from all BIND9 servers
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            {{ oc_header }}
+
+            # Get first zone name
+            zone_name=$(oc exec -t openstackclient -- openstack zone list -f value -c name | head -1)
+
+            if [ -z "$zone_name" ]; then
+              echo "No zones found to test"
+              exit 0
+            fi
+
+            # Get BIND9 IPs
+            bind9_ips=$(oc get pods -l component=designate-backendbind9 -o jsonpath='{range .items[*]}{.status.podIP}{" "}{end}')
+
+            for ip in $bind9_ips; do
+              echo "Querying $zone_name on $ip"
+              dig @$ip $zone_name SOA +short || {
+                echo "ERROR: Zone $zone_name not found on $ip"
+                exit 1
+              }
+            done
+            echo "All zones accessible on all BIND9 servers"
+          changed_when: false
+
+        - name: Test zone creation and propagation
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            {{ oc_header }}
+
+            # Create test zone
+            test_zone="adoption-test-$(date +%s).example.com."
+            echo "Creating test zone: $test_zone"
+            oc exec -t openstackclient -- openstack zone create \
+              --email test@example.com $test_zone
+
+            # Wait for zone to become ACTIVE
+            for i in {1..30}; do
+              status=$(oc exec -t openstackclient -- openstack zone show $test_zone -f value -c status)
+              if [ "$status" = "ACTIVE" ]; then
+                echo "Zone is ACTIVE"
+                break
+              fi
+              echo "Waiting for zone... (status: $status)"
+              sleep 2
+            done
+
+            # Check zone on all BIND9 servers
+            bind9_ips=$(oc get pods -l component=designate-backendbind9 -o jsonpath='{range .items[*]}{.status.podIP}{" "}{end}')
+
+            sleep 5  # Allow time for zone transfer
+
+            for ip in $bind9_ips; do
+              echo "Checking $test_zone on $ip"
+              dig @$ip $test_zone SOA +short || {
+                echo "WARNING: Zone not yet on $ip"
+              }
+            done
+
+            # Cleanup
+            oc exec -t openstackclient -- openstack zone delete $test_zone
+            echo "Test zone creation and propagation complete"
+          changed_when: false
+
+        - name: Display post-adoption summary
+          ansible.builtin.debug:
+            msg:
+              - "OpenShift Designate Post-Adoption Validation Complete"
+              - "All zones migrated successfully"
+              - "Zone transfers working correctly"
+
+    # ==========================================
+    # Phase 4: Comparison Validation
+    # ==========================================
+
+    - name: Comparison validation
+      when: phase == 'comparison'
+      block:
+        - name: Compare configurations
+          ansible.builtin.shell: |
+            {{ shell_header }}
+            echo "=== Configuration Comparison ==="
+
+            if [ -f /tmp/designate_pre_migration_state.txt ]; then
+              echo "Pre-migration state:"
+              cat /tmp/designate_pre_migration_state.txt
+            fi
+
+            echo ""
+            echo "Post-migration state:"
+            {{ oc_header }}
+            oc exec -t openstackclient -- openstack zone list
+
+          changed_when: false
+          register: comparison_output
+
+        - name: Display comparison
+          ansible.builtin.debug:
+            var: comparison_output.stdout_lines

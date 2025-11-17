@@ -1,0 +1,179 @@
+---
+# Create ConfigMap with preserved BIND9 IPs before deploying Designate
+
+- name: Ensure BIND9 IPs are available
+  ansible.builtin.assert:
+    that:
+      - tripleo_bind9_ips is defined
+      - tripleo_bind9_ips | length > 0
+    fail_msg: "No BIND9 IPs available. Run extract_bind_ips.yaml first."
+
+- name: Create BIND9 IP mapping ConfigMap data
+  ansible.builtin.set_fact:
+    bind_ip_configmap_data: |
+      {% for ip in tripleo_bind9_ips %}
+      bind_address_{{ loop.index0 }}: "{{ ip }}"
+      {% endfor %}
+
+- name: Check if BIND9 IP ConfigMap already exists
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc get configmap designate-bind-ip-map -n openstack -o json 2>/dev/null || echo '{"data": {}}'
+  register: existing_bind_ip_cm
+  failed_when: false
+
+- name: Parse existing ConfigMap
+  ansible.builtin.set_fact:
+    existing_bind_ips: "{{ (existing_bind_ip_cm.stdout | from_json).data | default({}) }}"
+
+- name: Check for IP conflicts
+  when: existing_bind_ips | length > 0
+  block:
+    - name: Compare existing vs. target IPs
+      ansible.builtin.set_fact:
+        ip_conflict: false
+        ip_differences: []
+
+    - name: Detect IP differences
+      ansible.builtin.set_fact:
+        ip_differences: "{{ ip_differences + [{ 'key': item.key, 'existing': item.value, 'target': tripleo_bind9_ips[item.key | regex_replace('bind_address_', '') | int] }] }}"
+      loop: "{{ existing_bind_ips | dict2items }}"
+      when:
+        - item.key.startswith('bind_address_')
+        - item.key | regex_replace('bind_address_', '') | int < (tripleo_bind9_ips | length)
+        - item.value != tripleo_bind9_ips[item.key | regex_replace('bind_address_', '') | int]
+
+    - name: Warn about IP conflicts
+      ansible.builtin.debug:
+        msg: |
+          WARNING: Existing BIND9 IP ConfigMap has different IPs!
+          Differences detected:
+          {% for diff in ip_differences %}
+            {{ diff.key }}: existing={{ diff.existing }}, target={{ diff.target }}
+          {% endfor %}
+
+          This may indicate:
+          1. A previous migration attempt
+          2. Multiple TripleO deployments sharing this OpenShift cluster
+          3. Manual IP configuration
+
+          The ConfigMap will be updated with TripleO IPs.
+      when: ip_differences | length > 0
+
+- name: Create or update BIND9 IP ConfigMap
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+
+    # Create ConfigMap with preserved IPs
+    cat <<EOF | oc apply -f -
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: designate-bind-ip-map
+      namespace: openstack
+      labels:
+        service: designate
+        component: backendbind9
+        migration: tripleo-adoption
+      annotations:
+        tripleo.openstack.org/source: "TripleO deployment"
+        tripleo.openstack.org/extracted-at: "{{ ansible_date_time.iso8601 }}"
+    data:
+    {% for ip in tripleo_bind9_ips %}
+      bind_address_{{ loop.index0 }}: "{{ ip }}"
+    {% endfor %}
+    EOF
+  register: bind_ip_cm_result
+
+- name: Verify ConfigMap created successfully
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    {{ oc_header }}
+    oc get configmap designate-bind-ip-map -n openstack -o yaml
+  register: bind_ip_cm_verify
+
+- name: Display ConfigMap contents
+  ansible.builtin.debug:
+    msg: |
+      BIND9 IP ConfigMap created/updated:
+      {{ bind_ip_cm_verify.stdout | from_yaml | to_nice_yaml }}
+
+- name: Verify IP count matches replica count
+  ansible.builtin.assert:
+    that:
+      - tripleo_bind9_ips | length == (designate_patch | from_yaml).spec.designate.template.designateBackendbind9.replicas | default(1)
+    fail_msg: |
+      Mismatch between BIND9 IP count ({{ tripleo_bind9_ips | length }}) and
+      replica count ({{ (designate_patch | from_yaml).spec.designate.template.designateBackendbind9.replicas | default(1) }})
+    success_msg: "IP count matches replica count: {{ tripleo_bind9_ips | length }}"
+  when: designate_patch is defined
+
+- name: Create verification script
+  ansible.builtin.copy:
+    content: |
+      #!/bin/bash
+      # Verify BIND9 pods are using correct IPs
+      # Generated: {{ ansible_date_time.iso8601 }}
+
+      set -e
+
+      echo "Verifying BIND9 IP preservation..."
+      echo "Expected IPs:"
+      {% for ip in tripleo_bind9_ips %}
+      echo "  - {{ ip }}"
+      {% endfor %}
+
+      echo ""
+      echo "Checking pod IPs:"
+      for i in $(seq 0 {{ (tripleo_bind9_ips | length) - 1 }}); do
+        POD_NAME="designate-backendbind9-$i"
+        EXPECTED_IP="{{ tripleo_bind9_ips[loop.index0] }}"
+
+        if oc get pod $POD_NAME -n openstack >/dev/null 2>&1; then
+          ACTUAL_IP=$(oc exec -n openstack $POD_NAME -- ip addr show 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1 || echo "NOT_FOUND")
+
+          if [ "$ACTUAL_IP" == "$EXPECTED_IP" ]; then
+            echo "  ✓ $POD_NAME: $ACTUAL_IP (correct)"
+          else
+            echo "  ✗ $POD_NAME: $ACTUAL_IP (expected: $EXPECTED_IP)"
+            exit 1
+          fi
+        else
+          echo "  ? $POD_NAME: Pod not found (may not be created yet)"
+        fi
+      done
+
+      echo ""
+      echo "Testing DNS queries to preserved IPs:"
+      {% for ip in tripleo_bind9_ips %}
+      if dig @{{ ip }} version.bind chaos txt +short +timeout=2 >/dev/null 2>&1; then
+        echo "  ✓ {{ ip }}: DNS responding"
+      else
+        echo "  ✗ {{ ip }}: DNS not responding"
+      fi
+      {% endfor %}
+
+      echo ""
+      echo "IP preservation verification complete!"
+    dest: "{{ playbook_dir }}/verify_bind9_ips.sh"
+    mode: '0755'
+  delegate_to: localhost
+
+- name: IP preservation summary
+  ansible.builtin.debug:
+    msg: |
+      ========================================
+      BIND9 IP PRESERVATION COMPLETE
+      ========================================
+      ConfigMap 'designate-bind-ip-map' created with {{ tripleo_bind9_ips | length }} IP(s).
+
+      When Designate BIND9 pods are deployed, they will use these IPs:
+      {% for ip in tripleo_bind9_ips %}
+        Pod designate-backendbind9-{{ loop.index0 }} -> {{ ip }}
+      {% endfor %}
+
+      Run verification after deployment:
+        {{ playbook_dir }}/verify_bind9_ips.sh
+      ========================================

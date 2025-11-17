@@ -1,0 +1,79 @@
+---
+# Extract Designate service configuration from TripleO deployment
+
+- name: Check if Designate is deployed
+  ansible.builtin.shell: |
+    {{ shell_header }}
+    ssh {{ hostvars[groups['controller'][0]]['ansible_host'] }} \
+      "systemctl list-units --all | grep -q tripleo_designate_api.service"
+  register: designate_check
+  changed_when: false
+  failed_when: false
+
+- name: Extract Designate configuration
+  when: designate_check.rc == 0
+  block:
+    - name: Get Designate database configuration
+      ansible.builtin.shell: |
+        {{ shell_header }}
+        ssh {{ hostvars[groups['controller'][0]]['ansible_host'] }} \
+          "sudo grep -E '^connection\s*=' /var/lib/config-data/puppet-generated/designate/etc/designate/designate.conf" | \
+          sed 's/.*@//' | sed 's/\/.*//'
+      register: designate_db_host
+      changed_when: false
+
+    - name: Get Designate transport URL
+      ansible.builtin.shell: |
+        {{ shell_header }}
+        ssh {{ hostvars[groups['controller'][0]]['ansible_host'] }} \
+          "sudo grep -E '^transport_url\s*=' /var/lib/config-data/puppet-generated/designate/etc/designate/designate.conf"
+      register: designate_transport
+      changed_when: false
+
+    - name: Check for BIND9 backend configuration
+      ansible.builtin.shell: |
+        {{ shell_header }}
+        ssh {{ hostvars[groups['controller'][0]]['ansible_host'] }} \
+          "sudo test -f /var/lib/config-data/ansible-generated/designate/etc/designate/pools.yaml"
+      register: bind9_pools_check
+      changed_when: false
+      failed_when: false
+
+    - name: Extract BIND9 pools configuration
+      when: bind9_pools_check.rc == 0
+      ansible.builtin.shell: |
+        {{ shell_header }}
+        ssh {{ hostvars[groups['controller'][0]]['ansible_host'] }} \
+          "sudo cat /var/lib/config-data/ansible-generated/designate/etc/designate/pools.yaml"
+      register: designate_pools_yaml
+      changed_when: false
+
+    - name: Display extracted Designate configuration
+      ansible.builtin.debug:
+        msg:
+          - "Designate DB Host: {{ designate_db_host.stdout }}"
+          - "Designate Transport: {{ designate_transport.stdout }}"
+          - "BIND9 Pools: {{ 'configured' if bind9_pools_check.rc == 0 else 'not found' }}"
+
+    - name: Save Designate configuration
+      ansible.builtin.copy:
+        content: |
+          # Designate Configuration Extracted from TripleO
+
+          ## Database Connection
+          {{ designate_db_host.stdout }}
+
+          ## Transport URL
+          {{ designate_transport.stdout }}
+
+          {% if bind9_pools_check.rc == 0 %}
+          ## BIND9 Pools Configuration
+          {{ designate_pools_yaml.stdout }}
+          {% endif %}
+        dest: "{{ dpa_tests_dir }}/extracted_designate_config.txt"
+      delegate_to: localhost
+
+- name: Designate not deployed
+  when: designate_check.rc != 0
+  ansible.builtin.debug:
+    msg: "Designate is not deployed in this TripleO environment"
